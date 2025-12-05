@@ -1,31 +1,32 @@
 # -------------------------------------------------------
-# SISTEMA DE RECOMENDACIÓN OPTIMIZADO (TF-IDF + LSA)
-# CON CACHÉ INTELIGENTE Y DETECCIÓN AUTOMÁTICA DE CAMBIOS
-# Autor: Tadeo Manuel Portillo Guzmán (Optimizado)
-# Proyecto: Plataforma "Destinos Turismo"
+# API DE RECOMENDACIÓN CON FASTAPI
+# Microservicio para sistema de recomendación de revistas
+# Puerto: 8000
 # -------------------------------------------------------
 
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
 import pandas as pd
 import joblib
-import hashlib
-import time
-from functools import lru_cache
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
 from nltk.corpus import stopwords
-from pathlib import Path
-from dotenv import load_dotenv
+import hashlib
+import time
 
 # ------------------------------------------
-# 1️⃣ CONFIGURACIÓN DE CONEXIÓN A LA BD
+# CONFIGURACIÓN
 # ------------------------------------------
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
-
 
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
@@ -34,130 +35,144 @@ DB_NAME = os.environ.get("DB_NAME", "impplacc_destinos")
 
 engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}")
 
-# Carpeta donde se guardarán los modelos
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Rutas de los archivos de modelo (OPTIMIZADO: agregamos similarity y hash)
 VECTORIZER_PATH = os.path.join(MODEL_DIR, "vectorizer.joblib")
 LSA_PATH = os.path.join(MODEL_DIR, "lsa_model.joblib")
 DF_PATH = os.path.join(MODEL_DIR, "revistas_df.joblib")
-SIMILARITY_PATH = os.path.join(MODEL_DIR, "similarity_matrix.joblib")  # ⭐ NUEVO
-ID_INDEX_PATH = os.path.join(MODEL_DIR, "id_index.joblib")  # ⭐ NUEVO
-DATA_HASH_PATH = os.path.join(MODEL_DIR, "data_hash.txt")  # ⭐ NUEVO
+SIMILARITY_PATH = os.path.join(MODEL_DIR, "similarity_matrix.joblib")
+ID_INDEX_PATH = os.path.join(MODEL_DIR, "id_index.joblib")
+DATA_HASH_PATH = os.path.join(MODEL_DIR, "data_hash.txt")
 
 
 # ------------------------------------------
-# 2️⃣ FUNCIÓN PARA CALCULAR HASH DE LOS DATOS
+# MODELOS PYDANTIC
+# ------------------------------------------
+class RecommendationRequest(BaseModel):
+    magazine_id: int
+    top_k: int = 5
+
+
+class RecommendationResponse(BaseModel):
+    id: int
+    title: str
+    region: str
+    cover_image_url: Optional[str]
+    similaridad: float
+
+
+class SystemStatus(BaseModel):
+    status: str
+    total_magazines: int
+    model_loaded: bool
+    last_training: Optional[str]
+
+
+# ------------------------------------------
+# FASTAPI APP
+# ------------------------------------------
+app = FastAPI(
+    title="API de Recomendación de Revistas",
+    description="Microservicio de ML para recomendaciones basadas en contenido",
+    version="1.0.0",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, especifica dominios
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Variables globales del modelo
+df = None
+vectorizer = None
+lsa = None
+similaridades = None
+id_to_idx = None
+
+
+# ------------------------------------------
+# FUNCIONES DE UTILIDAD
 # ------------------------------------------
 def calcular_hash_datos(df):
-    """
-    Genera un hash MD5 de los IDs y títulos para detectar cambios.
-    Más robusto que solo contar registros.
-    """
     datos_unicos = df[["id", "title"]].to_string()
     return hashlib.md5(datos_unicos.encode()).hexdigest()
 
 
-# ------------------------------------------
-# 3️⃣ FUNCIÓN DE ENTRENAMIENTO OPTIMIZADA
-# ------------------------------------------
 def entrenar_modelo():
-    print("\n🧠 Entrenando modelo TF-IDF + LSA optimizado...")
+    print("\n🧠 Entrenando modelo...")
     start_time = time.time()
 
     query = """
     SELECT 
         id,
         title,
-        COALESCE(description, '') AS description,
-        COALESCE(keywords, '') AS keywords,
-        COALESCE(topics, '') AS topics,
-        COALESCE(region, '') AS region
+        COALESCE(description, '')   AS description,
+        COALESCE(keywords, '')      AS keywords,
+        COALESCE(topics, '')        AS topics,
+        COALESCE(region, '')        AS region,
+        COALESCE(cover_image_url,'') AS cover_image_url
     FROM magazine;
     """
 
-    df = pd.read_sql(query, engine).fillna("")
-
-    # Combinar campos semánticos
-    df["texto_final"] = (
-        df["title"]
+    df_local = pd.read_sql(query, engine).fillna("")
+    df_local["texto_final"] = (
+        df_local["title"]
         + " "
-        + df["description"]
+        + df_local["description"]
         + " "
-        + df["keywords"]
+        + df_local["keywords"]
         + " "
-        + df["topics"]
+        + df_local["topics"]
         + " "
-        + df["region"]
+        + df_local["region"]
     )
 
-    # Descargar stopwords
     nltk.download("stopwords", quiet=True)
     spanish_stopwords = stopwords.words("spanish")
 
-    # ⭐ OPTIMIZACIÓN: Ajustar hiperparámetros dinámicamente
-    n_registros = len(df)
+    n_registros = len(df_local)
     max_features = min(3000, n_registros * 10)
 
-    print(f"📊 Dataset: {n_registros} revistas")
-
-    # TF-IDF (sin min_df para datasets pequeños)
-    vectorizer = TfidfVectorizer(
+    vectorizer_local = TfidfVectorizer(
         stop_words=spanish_stopwords,
         max_features=max_features,
-        min_df=1,  # ⭐ Ajustado para datasets pequeños
-        max_df=0.95,  # ⭐ Más permisivo
+        min_df=1,
+        max_df=0.95,
     )
-    tfidf_matrix = vectorizer.fit_transform(df["texto_final"])
+    tfidf_matrix = vectorizer_local.fit_transform(df_local["texto_final"])
 
-    # ⭐ CRÍTICO: n_components debe ser menor que n_features
     n_features_real = tfidf_matrix.shape[1]
-    n_components = min(100, max(10, n_features_real - 1))  # Siempre menor que features
+    n_components = min(100, max(10, n_features_real - 1))
 
-    print(f"🔧 Features extraídos: {n_features_real}")
-    print(f"🔧 Componentes LSA: {n_components}")
+    lsa_local = TruncatedSVD(n_components=n_components, random_state=42)
+    lsa_matrix = lsa_local.fit_transform(tfidf_matrix)
 
-    # LSA
-    lsa = TruncatedSVD(n_components=n_components, random_state=42)
-    lsa_matrix = lsa.fit_transform(tfidf_matrix)
+    similaridades_local = cosine_similarity(lsa_matrix)
+    id_to_idx_local = {id_val: idx for idx, id_val in enumerate(df_local["id"])}
 
-    # ⭐ OPTIMIZACIÓN: Calcular y guardar matriz de similitud
-    print("🔄 Calculando matriz de similitud...")
-    similaridades = cosine_similarity(lsa_matrix)
+    data_hash = calcular_hash_datos(df_local)
 
-    # ⭐ OPTIMIZACIÓN: Crear índice de IDs para búsqueda O(1)
-    id_to_idx = {id_val: idx for idx, id_val in enumerate(df["id"])}
-
-    # Calcular hash de los datos
-    data_hash = calcular_hash_datos(df)
-
-    # Guardar todos los artefactos
-    joblib.dump(vectorizer, VECTORIZER_PATH)
-    joblib.dump(lsa, LSA_PATH)
-    joblib.dump(df, DF_PATH)
-    joblib.dump(similaridades, SIMILARITY_PATH)  # ⭐ NUEVO
-    joblib.dump(id_to_idx, ID_INDEX_PATH)  # ⭐ NUEVO
+    joblib.dump(vectorizer_local, VECTORIZER_PATH)
+    joblib.dump(lsa_local, LSA_PATH)
+    joblib.dump(df_local, DF_PATH)
+    joblib.dump(similaridades_local, SIMILARITY_PATH)
+    joblib.dump(id_to_idx_local, ID_INDEX_PATH)
 
     with open(DATA_HASH_PATH, "w") as f:
         f.write(data_hash)
 
     elapsed = time.time() - start_time
-    print(f"✅ Modelos entrenados y guardados en {elapsed:.2f}s\n")
+    print(f"✅ Modelo entrenado en {elapsed:.2f}s")
 
-    return df, vectorizer, lsa, similaridades, id_to_idx
+    return df_local, vectorizer_local, lsa_local, similaridades_local, id_to_idx_local
 
 
-# ------------------------------------------
-# 4️⃣ DETECCIÓN INTELIGENTE DE CAMBIOS
-# ------------------------------------------
 def necesita_reentrenamiento():
-    """
-    Retorna True si:
-    - No existen los modelos
-    - El hash de los datos cambió (nuevos/modificados/eliminados registros)
-    """
-    # Verificar existencia de archivos
     archivos_necesarios = [
         VECTORIZER_PATH,
         LSA_PATH,
@@ -168,141 +183,143 @@ def necesita_reentrenamiento():
     ]
 
     if not all(os.path.exists(f) for f in archivos_necesarios):
-        print("⚙️ Modelos no encontrados. Se entrenará por primera vez.")
         return True
 
-    # Cargar DataFrame guardado
     df_guardado = joblib.load(DF_PATH)
 
-    # Cargar hash anterior
     with open(DATA_HASH_PATH, "r") as f:
         hash_anterior = f.read().strip()
 
-    # Consultar datos actuales de la BD
     query = """
     SELECT 
         id,
         title,
-        COALESCE(description, '') AS description,
-        COALESCE(keywords, '') AS keywords,
-        COALESCE(topics, '') AS topics,
-        COALESCE(region, '') AS region
+        COALESCE(description, '')   AS description,
+        COALESCE(keywords, '')      AS keywords,
+        COALESCE(topics, '')        AS topics,
+        COALESCE(region, '')        AS region,
+        COALESCE(cover_image_url,'') AS cover_image_url
     FROM magazine;
     """
     df_actual = pd.read_sql(query, engine).fillna("")
 
-    # Calcular hash actual
     hash_actual = calcular_hash_datos(df_actual[["id", "title"]])
 
-    # Comparar hashes
-    if hash_actual != hash_anterior:
-        num_anterior = len(df_guardado)
-        num_actual = len(df_actual)
-        print(f"📈 Cambios detectados en la tabla magazine")
-        print(f"   Registros: {num_anterior} → {num_actual}")
-        print(f"   Hash anterior: {hash_anterior[:8]}...")
-        print(f"   Hash actual: {hash_actual[:8]}...")
-        return True
-
-    print("✅ No se detectaron cambios en la tabla magazine.")
-    return False
+    return hash_actual != hash_anterior
 
 
 # ------------------------------------------
-# 5️⃣ FUNCIÓN DE RECOMENDACIÓN OPTIMIZADA
+# STARTUP EVENT
 # ------------------------------------------
-@lru_cache(maxsize=200)  # ⭐ CACHÉ para recomendaciones frecuentes
-def recomendar_revistas(id_revista, top_k=5):
-    """
-    Retorna las revistas más similares a una revista dada.
-    OPTIMIZADO con búsqueda O(1) y caché LRU.
-    """
-    # ⭐ OPTIMIZACIÓN: Búsqueda O(1) con hash map
-    if id_revista not in id_to_idx:
-        print("❌ El ID de revista no existe en la base de datos.")
-        return None
+@app.on_event("startup")
+async def startup_event():
+    global df, vectorizer, lsa, similaridades, id_to_idx
 
-    idx = id_to_idx[id_revista]
+    print("🚀 Iniciando API de Recomendación...")
 
-    # Obtener similitudes (ya precalculadas)
+    if necesita_reentrenamiento():
+        df, vectorizer, lsa, similaridades, id_to_idx = entrenar_modelo()
+    else:
+        print("💾 Cargando modelos existentes...")
+        start_time = time.time()
+
+        vectorizer = joblib.load(VECTORIZER_PATH)
+        lsa = joblib.load(LSA_PATH)
+        df = joblib.load(DF_PATH)
+        similaridades = joblib.load(SIMILARITY_PATH)
+        id_to_idx = joblib.load(ID_INDEX_PATH)
+
+        elapsed = time.time() - start_time
+        print(f"✅ Modelos cargados en {elapsed:.2f}s")
+
+    print(f"📊 Total revistas: {len(df)}")
+
+
+# ------------------------------------------
+# ENDPOINTS
+# ------------------------------------------
+@app.get("/", response_model=SystemStatus)
+async def root():
+    """Estado del sistema"""
+    last_training = None
+    if os.path.exists(DATA_HASH_PATH):
+        mtime = os.path.getmtime(DATA_HASH_PATH)
+        last_training = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+
+    return {
+        "status": "running",
+        "total_magazines": len(df) if df is not None else 0,
+        "model_loaded": df is not None,
+        "last_training": last_training,
+    }
+
+
+@app.post("/recommend", response_model=List[RecommendationResponse])
+async def get_recommendations(request: RecommendationRequest):
+    """
+    Obtener recomendaciones para una revista específica
+    """
+    if df is None or id_to_idx is None or similaridades is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado")
+
+    if request.magazine_id not in id_to_idx:
+        raise HTTPException(status_code=404, detail="Revista no encontrada")
+
+    idx = id_to_idx[request.magazine_id]
     sim_scores = list(enumerate(similaridades[idx]))
     sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-
-    # Excluir la revista original
     sim_scores = [s for s in sim_scores if s[0] != idx]
-    top_similares = sim_scores[:top_k]
+    top_similares = sim_scores[: request.top_k]
 
-    recomendaciones = df.iloc[[i for i, _ in top_similares]][
-        ["id", "title", "region"]
-    ].copy()
-    recomendaciones["similaridad"] = [round(s, 3) for _, s in top_similares]
+    recomendaciones = []
+    for i, score in top_similares:
+        revista = df.iloc[i]
+        recomendaciones.append(
+            {
+                "id": int(revista["id"]),
+                "title": str(revista["title"]),
+                "region": str(revista["region"]),
+                "cover_image_url": str(revista.get("cover_image_url", "")),
+                "similaridad": round(float(score), 3),
+            }
+        )
 
     return recomendaciones
 
 
-# ------------------------------------------
-# 6️⃣ CARGA O REENTRENAMIENTO AUTOMÁTICO
-# ------------------------------------------
-if necesita_reentrenamiento():
-    df, vectorizer, lsa, similaridades, id_to_idx = entrenar_modelo()
-    # Limpiar caché de recomendaciones
-    recomendar_revistas.cache_clear()
-else:
-    print("💾 Cargando modelos existentes...")
-    start_time = time.time()
-
-    vectorizer = joblib.load(VECTORIZER_PATH)
-    lsa = joblib.load(LSA_PATH)
-    df = joblib.load(DF_PATH)
-    similaridades = joblib.load(SIMILARITY_PATH)  # ⭐ CARGA DIRECTA
-    id_to_idx = joblib.load(ID_INDEX_PATH)  # ⭐ CARGA DIRECTA
-
-    elapsed = time.time() - start_time
-    print(f"✅ Modelos cargados en {elapsed:.2f}s\n")
-
-
-# ------------------------------------------
-# 7️⃣ FUNCIÓN DE ESTADÍSTICAS DEL SISTEMA
-# ------------------------------------------
-def mostrar_estadisticas():
-    """Muestra información sobre el sistema y el modelo cargado."""
-    print("\n" + "=" * 60)
-    print("📊 ESTADÍSTICAS DEL SISTEMA DE RECOMENDACIÓN")
-    print("=" * 60)
-    print(f"Total de revistas: {len(df)}")
-    print(f"Dimensiones TF-IDF: {vectorizer.max_features}")
-    print(f"Componentes LSA: {lsa.n_components}")
-    print(f"Tamaño matriz similitud: {similaridades.shape}")
-    print(f"Caché de recomendaciones: {recomendar_revistas.cache_info()}")
-    print("=" * 60 + "\n")
-
-
-# ------------------------------------------
-# 8️⃣ EJEMPLO DE USO
-# ------------------------------------------
-if __name__ == "__main__":
-    mostrar_estadisticas()
-
-    print("🔍 SISTEMA DE RECOMENDACIÓN DE REVISTAS (OPTIMIZADO)\n")
+@app.post("/retrain")
+async def force_retrain():
+    """
+    Forzar reentrenamiento del modelo (útil cuando se agregan revistas)
+    """
+    global df, vectorizer, lsa, similaridades, id_to_idx
 
     try:
-        ejemplo_id = int(input("Ingrese el ID de la revista para recomendar: "))
-
-        start_time = time.time()
-        resultado = recomendar_revistas(ejemplo_id, top_k=5)
-        elapsed = time.time() - start_time
-
-        if resultado is not None:
-            print("\n🧭 Revistas más similares:\n")
-            print(resultado.to_string(index=False))
-            print(f"\n⏱️  Tiempo de respuesta: {elapsed*1000:.2f}ms")
-
-            # Mostrar si vino del caché
-            cache_info = recomendar_revistas.cache_info()
-            if cache_info.hits > 0:
-                print(f"💾 (Servido desde caché)")
-
-    except ValueError:
-        print("\n⚠️ Por favor ingrese un número válido.")
+        df, vectorizer, lsa, similaridades, id_to_idx = entrenar_modelo()
+        return {
+            "status": "success",
+            "message": "Modelo reentrenado correctamente",
+            "total_magazines": len(df),
+        }
     except Exception as e:
-        print(f"\n⚠️ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
+# ------------------------------------------
+# EJECUTAR (solo para desarrollo)
+# ------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,  # Eliminar en producción
+    )
